@@ -24,18 +24,6 @@ import { ModalityPlaceholder } from "./modality-placeholder";
 
 type ModelNodeRfProps = RfDataNodeProps<"modelNode">;
 
-// Spark must stay dynamic (browser-only entry)
-// Spark WASM currently breaks Next build — disabled
-// Production can load Spark via CDN chunk
-const _SplatMesh: any = null;
-
-// Spark bootstrap — disabled for now
-async function _initSparkIfNeeded() {
-    // Spark WASM module disabled due to Next.js webpack compatibility issues
-    // Prefer CDN bundle in production
-    logger.debug("Gaussian Splatting support requires separate CDN loading");
-}
-
 // Frame camera to bound the mesh
 const _fitCameraToSelection = (
     camera: THREE.PerspectiveCamera,
@@ -71,6 +59,33 @@ const _fitCameraToSelection = (
     controls.update();
 };
 
+// Object-space bounds that also work for a Gaussian-splat SplatMesh. A SplatMesh
+// has no traversable triangle geometry, so Box3.setFromObject returns empty;
+// fall back to expanding over splat centers via Spark's forEachSplat.
+type SplatLike = {
+    forEachSplat?: (
+        cb: (
+            index: number,
+            center: THREE.Vector3,
+            scales: THREE.Vector3,
+            quaternion: THREE.Quaternion,
+            opacity: number,
+            color: THREE.Color,
+        ) => void,
+    ) => void;
+};
+const computeObjectBounds = (model: THREE.Object3D): THREE.Box3 => {
+    const box = new THREE.Box3().setFromObject(model);
+    if (!box.isEmpty()) return box;
+    const splat = model as unknown as SplatLike;
+    if (typeof splat.forEachSplat === "function") {
+        splat.forEachSplat((_i, center) => {
+            box.expandByPoint(center);
+        });
+    }
+    return box;
+};
+
 // Naive fit + center helper
 const autoScaleAndCenter = (
     model: THREE.Object3D,
@@ -78,7 +93,10 @@ const autoScaleAndCenter = (
     containerWidth: number,
     containerHeight: number,
 ) => {
-    const box = new THREE.Box3().setFromObject(model);
+    const box = computeObjectBounds(model);
+    // No derivable bounds (e.g. an empty/!forEachSplat object): leave the model
+    // at its native transform rather than computing a NaN center.
+    if (box.isEmpty()) return;
     const size = box.getSize(new THREE.Vector3());
     const center = box.getCenter(new THREE.Vector3());
 
@@ -129,6 +147,13 @@ const FullScreen3DModal = ({
     const cameraRef = useRef<THREE.PerspectiveCamera | null>(null);
     const modelRef = useRef<THREE.Object3D | null>(null);
     const animationIdRef = useRef<number | null>(null);
+    // Re-arm the on-demand render loop from outside setupScene (e.g. reset view).
+    const requestRenderRef = useRef<((frames?: number) => void) | null>(null);
+    // Camera-controls instance (typed loosely; imported dynamically).
+    const controlsRef = useRef<{
+        reset: () => void;
+        dispose: () => void;
+    } | null>(null);
     const [isLoading, setIsLoading] = useState(true);
     const [error, setError] = useState<string | null>(null);
     const { url } = useFileAsyncLoader(fileKey, { priority: "high" });
@@ -170,7 +195,9 @@ const FullScreen3DModal = ({
                     alpha: true,
                 });
                 renderer.setSize(width, height);
-                renderer.setPixelRatio(window.devicePixelRatio);
+                // Cap DPR: at native retina (2–3x) Spark sorts/draws 4–9x the
+                // splats per frame, which pegs the GPU. 2 is plenty for preview.
+                renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
                 renderer.outputColorSpace = THREE.SRGBColorSpace; // Respect sRGB color space
                 rendererRef.current = renderer;
 
@@ -204,84 +231,20 @@ const FullScreen3DModal = ({
                 backLight.position.set(0, 5, -5);
                 scene.add(backLight);
 
-                // Orbit / drag damping state
-                let isDragging = false;
-                let previousMousePosition = { x: 0, y: 0 };
-                const rotation = { x: 0, y: 0 };
-                const targetRotation = { x: 0, y: 0 };
-
-                // Pointer listeners
-                const pointerdownHandler = (e: any) => {
-                    // Ignore UI chrome outside WebGL canvas
-                    if (e.target !== renderer.domElement) return;
-                    e.stopPropagation();
-                    e.preventDefault();
-                    isDragging = true;
-                    previousMousePosition = { x: e.clientX, y: e.clientY };
+                // On-demand rendering: only draw when something changed. A frame
+                // budget is armed on load/interaction and decremented per drawn
+                // frame; when it hits 0 the loop idles (no GPU work). The warmup
+                // budget also lets Spark's async splat sort converge after load.
+                let renderBudget = 120;
+                const requestRender = (frames = 90) => {
+                    renderBudget = Math.max(renderBudget, frames);
                 };
+                requestRenderRef.current = requestRender;
 
-                const pointermoveHandler = (e: any) => {
-                    if (!isDragging || !modelRef.current) return;
-                    e.stopPropagation();
-                    e.preventDefault();
-
-                    const deltaX = e.clientX - previousMousePosition.x;
-                    const deltaY = e.clientY - previousMousePosition.y;
-
-                    targetRotation.y += deltaX * 0.01;
-                    targetRotation.x += deltaY * 0.01;
-                    // Clamp polar orbit extremes
-                    targetRotation.x = Math.max(
-                        -Math.PI / 2,
-                        Math.min(Math.PI / 2, targetRotation.x),
-                    );
-
-                    previousMousePosition = { x: e.clientX, y: e.clientY };
-                };
-
-                const pointerupHandler = (e: any) => {
-                    e.stopPropagation();
-                    isDragging = false;
-                };
-
-                const pointerleaveHandler = (e: any) => {
-                    e.stopPropagation();
-                    isDragging = false;
-                };
-
-                const wheelHandler = (e: any) => {
-                    if (e.target !== renderer.domElement) return;
-                    e.preventDefault();
-                    e.stopPropagation();
-                    const scrollDelta = e.deltaY > 0 ? 1.1 : 0.9;
-                    camera.position.multiplyScalar(scrollDelta);
-                    // Clamp dollying distance
-                    const distance = camera.position.length();
-                    if (distance < 1) camera.position.setLength(1);
-                    if (distance > 100) camera.position.setLength(100);
-                };
-
-                // Attach pointer observers
+                // Keep gestures from bubbling to page scroll behind the modal.
                 const canvas = renderer.domElement;
-                canvas.addEventListener(
-                    "pointerdown",
-                    pointerdownHandler,
-                    true,
-                );
-                window.addEventListener(
-                    "pointermove",
-                    pointermoveHandler,
-                    true,
-                ); // Window-level listeners for smoother drags outside canvas bounds
-                window.addEventListener("pointerup", pointerupHandler, true);
-                canvas.addEventListener(
-                    "pointerleave",
-                    pointerleaveHandler,
-                    true,
-                );
-                canvas.addEventListener("wheel", wheelHandler, {
-                    passive: false,
-                });
+                const stopProp = (e: Event) => e.stopPropagation();
+                canvas.addEventListener("wheel", stopProp, { passive: false });
 
                 // Stream chosen loader path
                 const extension = fileExtension.toLowerCase();
@@ -298,7 +261,13 @@ const FullScreen3DModal = ({
                         extension === ".ksplat" ||
                         extension === ".sog"
                     ) {
-                        await loadSplat(url, scene, modelRef);
+                        await loadSplat(
+                            url,
+                            scene,
+                            modelRef,
+                            renderer,
+                            extension,
+                        );
                     } else if (extension === ".fbx") {
                         await loadFBX(url, scene, modelRef);
                     } else if (extension === ".stl") {
@@ -331,29 +300,42 @@ const FullScreen3DModal = ({
                     throw loadErr;
                 }
 
-                // Autoscale after parse completes
+                // Autoscale + center the model at the origin and position the
+                // camera before constructing the controls (Arcball captures the
+                // current camera pose as its "home" / reset baseline).
                 if (modelRef.current) {
                     autoScaleAndCenter(modelRef.current, camera, width, height);
-
-                    // Seed inertia target quaternion
-                    targetRotation.x = modelRef.current.rotation.x;
-                    targetRotation.y = modelRef.current.rotation.y;
                 }
 
-                // requestAnimationFrame driver
+                // Virtual-trackball controls: grab-and-tumble in ANY direction
+                // with no pole/gimbal lock (unlike OrbitControls' fixed up-axis),
+                // wheel zooms, right-drag pans. Fires "change" (incl. during its
+                // own damping) so we can render on demand; no per-frame update().
+                const { ArcballControls } = await import(
+                    "three/examples/jsm/controls/ArcballControls.js"
+                );
+                const controls = new ArcballControls(
+                    camera,
+                    renderer.domElement,
+                    scene,
+                );
+                controls.enableAnimations = true;
+                controls.cursorZoom = true;
+                controls.minDistance = 0.5;
+                controls.maxDistance = 100;
+                controls.setGizmosVisible(false);
+                controls.addEventListener("change", () => requestRender(2));
+                controls.saveState(); // baseline for "reset view"
+                controlsRef.current = controls;
+                requestRender();
+
+                // requestAnimationFrame driver (renders only while armed).
                 const animate = () => {
                     animationIdRef.current = requestAnimationFrame(animate);
-
-                    if (modelRef.current) {
-                        const easing = 0.1;
-                        rotation.x += (targetRotation.x - rotation.x) * easing;
-                        rotation.y += (targetRotation.y - rotation.y) * easing;
-
-                        modelRef.current.rotation.x = rotation.x;
-                        modelRef.current.rotation.y = rotation.y;
+                    if (renderBudget > 0) {
+                        renderBudget--;
+                        renderer.render(scene, camera);
                     }
-
-                    renderer.render(scene, camera);
                 };
                 animate();
 
@@ -370,6 +352,7 @@ const FullScreen3DModal = ({
                     cameraRef.current.aspect = newWidth / newHeight;
                     cameraRef.current.updateProjectionMatrix();
                     rendererRef.current.setSize(newWidth, newHeight);
+                    requestRender();
                 });
 
                 if (mountRef.current) {
@@ -382,33 +365,14 @@ const FullScreen3DModal = ({
                 // Dispose geometries + textures
                 return () => {
                     resizeObserver.disconnect();
-                    window.removeEventListener(
-                        "pointermove",
-                        pointermoveHandler,
-                        true,
-                    );
-                    window.removeEventListener(
-                        "pointerup",
-                        pointerupHandler,
-                        true,
-                    );
-                    if (canvas) {
-                        canvas.removeEventListener(
-                            "pointerdown",
-                            pointerdownHandler,
-                            true,
-                        );
-                        canvas.removeEventListener(
-                            "pointerleave",
-                            pointerleaveHandler,
-                            true,
-                        );
-                        canvas.removeEventListener("wheel", wheelHandler);
-                    }
-
+                    canvas.removeEventListener("wheel", stopProp);
+                    controls.dispose();
+                    controlsRef.current = null;
+                    requestRenderRef.current = null;
                     if (animationIdRef.current) {
                         cancelAnimationFrame(animationIdRef.current);
                     }
+                    disposeSplat(sceneRef.current, modelRef.current);
                     renderer.dispose();
                 };
             } catch (err) {
@@ -454,17 +418,9 @@ const FullScreen3DModal = ({
     }, [url, setupScene]);
 
     const handleResetView = () => {
-        if (modelRef.current && cameraRef.current && mountRef.current) {
-            autoScaleAndCenter(
-                modelRef.current,
-                cameraRef.current,
-                mountRef.current.clientWidth,
-                mountRef.current.clientHeight,
-            );
-            if (modelRef.current) {
-                modelRef.current.rotation.set(0, 0, 0);
-            }
-        }
+        // Restore the camera/target baseline captured after initial framing.
+        controlsRef.current?.reset();
+        requestRenderRef.current?.();
     };
 
     const handleDownload = () => {
@@ -633,66 +589,22 @@ const MiniModelPreview = ({
                 cameraLight.position.set(0, 0, 1);
                 camera.add(cameraLight);
 
-                // Interaction state
-                let isDragging = false;
-                let previousMousePosition = { x: 0, y: 0 };
-                const rotation = { x: 0, y: 0 };
-                const targetRotation = { x: 0, y: 0 };
-
-                // Event Handlers
-                const onPointerDown = (e: PointerEvent) => {
-                    if (e.target !== renderer.domElement) return;
-                    // CRITICAL: Stop propagation to prevent React Flow from dragging the node
-                    e.stopPropagation();
-                    e.preventDefault();
-                    isDragging = true;
-                    previousMousePosition = { x: e.clientX, y: e.clientY };
-                    (renderer.domElement as HTMLElement).style.cursor =
-                        "grabbing";
+                // On-demand rendering budget (see fullscreen viewer for rationale).
+                // Critical here: an idle node preview must not render 262k splats
+                // every frame forever, or several model nodes together stall the PC.
+                let renderBudget = 120;
+                const requestRender = (frames = 90) => {
+                    renderBudget = Math.max(renderBudget, frames);
                 };
 
-                const onPointerMove = (e: PointerEvent) => {
-                    if (!isDragging) return;
-                    e.stopPropagation();
-                    e.preventDefault();
-
-                    const deltaX = e.clientX - previousMousePosition.x;
-                    const deltaY = e.clientY - previousMousePosition.y;
-
-                    targetRotation.y += deltaX * 0.01;
-                    targetRotation.x += deltaY * 0.01;
-                    targetRotation.x = Math.max(
-                        -Math.PI / 2,
-                        Math.min(Math.PI / 2, targetRotation.x),
-                    );
-
-                    previousMousePosition = { x: e.clientX, y: e.clientY };
-                };
-
-                const onPointerUp = (e: PointerEvent) => {
-                    if (isDragging) {
-                        e.stopPropagation();
-                        isDragging = false;
-                        (renderer.domElement as HTMLElement).style.cursor =
-                            "grab";
-                    }
-                };
-
-                const onWheel = (e: WheelEvent) => {
-                    if (e.target !== renderer.domElement) return;
-                    // Prevent zooming the flow canvas
-                    e.stopPropagation();
-                    // Optional: Implement zoom for mini preview if needed, but might be too cluttered
-                    // For now, just stop propagation
-                };
-
-                // Attach events
+                // Keep drag/zoom inside the node: stop the gestures from bubbling
+                // to React Flow (which would pan/zoom the canvas or drag the node).
+                // The ArcballControls instance is created later (after framing).
                 const canvas = renderer.domElement;
                 canvas.style.cursor = "grab";
-                canvas.addEventListener("pointerdown", onPointerDown);
-                window.addEventListener("pointermove", onPointerMove); // Window for smooth drag outside
-                window.addEventListener("pointerup", onPointerUp);
-                canvas.addEventListener("wheel", onWheel, { passive: false });
+                const stopProp = (e: Event) => e.stopPropagation();
+                canvas.addEventListener("pointerdown", stopProp);
+                canvas.addEventListener("wheel", stopProp, { passive: false });
 
                 // Load Model
                 const ext = fileExtension.toLowerCase();
@@ -725,7 +637,7 @@ const MiniModelPreview = ({
                         ext === ".ksplat" ||
                         ext === ".sog"
                     )
-                        await loadSplat(url, scene, modelHolder);
+                        await loadSplat(url, scene, modelHolder, renderer, ext);
                     else if (ext === ".igs" || ext === ".iges")
                         await loadIGES(url, scene, modelHolder);
                     else if (ext === ".step" || ext === ".stp")
@@ -743,28 +655,41 @@ const MiniModelPreview = ({
                         width,
                         height,
                     );
-
-                    // Initial nice angle
-                    targetRotation.x = -0.2;
-                    targetRotation.y = 0.5;
-                    rotation.x = -0.2;
-                    rotation.y = 0.5;
-                    modelHolder.current.rotation.x = rotation.x;
-                    modelHolder.current.rotation.y = rotation.y;
                 }
+                // Nudge to a pleasant elevated 3/4 view before constructing the
+                // controls (Arcball captures this camera pose as its home).
+                const dist = camera.position.length() || 12;
+                camera.position
+                    .set(dist * 0.7, dist * 0.45, dist * 0.7)
+                    .setLength(dist);
+                camera.lookAt(0, 0, 0);
 
-                // Animation Loop
+                // Virtual-trackball controls: free tumble in any direction, no
+                // pole lock. Same scheme as the fullscreen viewer. Fires "change"
+                // (incl. during damping), driving on-demand rendering.
+                const { ArcballControls } = await import(
+                    "three/examples/jsm/controls/ArcballControls.js"
+                );
+                const controls = new ArcballControls(
+                    camera,
+                    renderer.domElement,
+                    scene,
+                );
+                controls.enableAnimations = true;
+                controls.cursorZoom = true;
+                controls.minDistance = 0.5;
+                controls.maxDistance = 100;
+                controls.setGizmosVisible(false);
+                controls.addEventListener("change", () => requestRender(2));
+                requestRender();
+
+                // Animation Loop (renders only while armed; idles otherwise)
                 const animate = () => {
                     animationIdRef.current = requestAnimationFrame(animate);
-
-                    if (modelRef.current) {
-                        const easing = 0.1;
-                        rotation.x += (targetRotation.x - rotation.x) * easing;
-                        rotation.y += (targetRotation.y - rotation.y) * easing;
-                        modelRef.current.rotation.x = rotation.x;
-                        modelRef.current.rotation.y = rotation.y;
+                    if (renderBudget > 0) {
+                        renderBudget--;
+                        renderer.render(scene, camera);
                     }
-                    renderer.render(scene, camera);
                 };
                 animate();
                 setIsLoading(false);
@@ -773,10 +698,10 @@ const MiniModelPreview = ({
                 cleanup = () => {
                     if (animationIdRef.current)
                         cancelAnimationFrame(animationIdRef.current);
-                    canvas.removeEventListener("pointerdown", onPointerDown);
-                    window.removeEventListener("pointermove", onPointerMove);
-                    window.removeEventListener("pointerup", onPointerUp);
-                    canvas.removeEventListener("wheel", onWheel);
+                    canvas.removeEventListener("pointerdown", stopProp);
+                    canvas.removeEventListener("wheel", stopProp);
+                    controls.dispose();
+                    disposeSplat(sceneRef.current, modelRef.current);
                     renderer.dispose();
                 };
             } catch (err) {
@@ -887,27 +812,67 @@ async function loadOBJ(
 }
 
 // Loader: Gaussian splat payload
+// Name of the per-scene SparkRenderer (one drives sorting/compositing for all
+// SplatMeshes in a scene; reused across loads).
+const SPARK_RENDERER_NAME = "__spark_renderer__";
+
+// Loader: Gaussian Splatting (.ply / .spz / .splat / .ksplat / .sog) via SparkJS.
+// Spark is imported dynamically so its WASM module is never evaluated during SSR
+// or build — only client-side when a splat is actually viewed (paired with the
+// `url: false` webpack parser tweak in next.config.ts).
 async function loadSplat(
-    _url: string,
+    url: string,
     scene: THREE.Scene,
     modelRef: React.MutableRefObject<THREE.Object3D | null>,
+    renderer: THREE.WebGLRenderer,
+    ext: string,
 ): Promise<void> {
-    // Gaussian Splatting support is temporarily disabled due to WASM compatibility issues
-    // Create a placeholder geometry to show in the scene
-    const geometry = new THREE.SphereGeometry(1, 32, 32);
-    const material = new THREE.MeshPhongMaterial({
-        color: 0x64b5f6,
-        emissive: 0x2196f3,
-        shininess: 100,
-    });
-    const mesh = new THREE.Mesh(geometry, material);
+    const { SparkRenderer, SplatMesh, SplatFileType } = await import(
+        "@sparkjsdev/spark"
+    );
 
+    // Install a SparkRenderer into the scene once; the existing
+    // renderer.render(scene, camera) loop drives it via onBeforeRender.
+    if (!scene.getObjectByName(SPARK_RENDERER_NAME)) {
+        const spark = new SparkRenderer({ renderer });
+        spark.name = SPARK_RENDERER_NAME;
+        scene.add(spark);
+    }
+
+    // .ply / .spz / .sog auto-detect from content; .splat / .ksplat need an
+    // explicit fileType (they carry no self-describing header). Inferred from
+    // the enum members via a ternary — SplatFileType is a dynamic-import value
+    // binding and can't be used in a type-annotation position.
+    const lower = ext.toLowerCase();
+    const fileType =
+        lower === ".ply"
+            ? SplatFileType.PLY
+            : lower === ".spz"
+              ? SplatFileType.SPZ
+              : lower === ".splat"
+                ? SplatFileType.SPLAT
+                : lower === ".ksplat"
+                  ? SplatFileType.KSPLAT
+                  : undefined;
+
+    const mesh = new SplatMesh(fileType ? { url, fileType } : { url });
+    // Wait for decode so downstream framing (autoScaleAndCenter) sees real bounds.
+    await mesh.initialized;
     scene.add(mesh);
     modelRef.current = mesh;
+}
 
-    logger.debug(
-        "Gaussian Splatting (.splat, .spz) files require separate CDN loading. Showing placeholder.",
-    );
+// Dispose a SplatMesh + its scene's SparkRenderer (best-effort; both expose
+// dispose()). Called from each viewer's teardown.
+function disposeSplat(
+    scene: THREE.Scene | null,
+    model: THREE.Object3D | null,
+): void {
+    (model as { dispose?: () => void } | null)?.dispose?.();
+    const spark = scene?.getObjectByName(SPARK_RENDERER_NAME) as
+        | (THREE.Object3D & { dispose?: () => void })
+        | undefined;
+    spark?.dispose?.();
 }
 
 // Loader: Autodesk FBX
