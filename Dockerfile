@@ -54,7 +54,7 @@ COPY --from=builder /app/config ./config
 COPY --from=builder /app/sdk ./sdk
 
 # /data: SQLite db + uploads + settings.json + plugin venv. /plugins: installed plugins.
-VOLUME ["/data", "/plugins"]
+# VOLUME ["/data", "/plugins"]
 
 EXPOSE 3000
 CMD ["node", "server.js"]
